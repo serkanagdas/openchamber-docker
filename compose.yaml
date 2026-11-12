@@ -21,9 +21,12 @@ services:
       - oc_opencode:/home/openchamber/.config/opencode
       - oc_ssh:/home/openchamber/.ssh
       - projects:/home/openchamber/workspaces
+      - projects:/projects
     networks:
       - default
       - ai-gateway
+      - gitlab_default
+      - postgres-dev-net
 
 volumes:
   oc_config:
@@ -38,3 +41,9 @@ volumes:
 networks:
   ai-gateway:
     external: true
+  gitlab_default:
+    external: true
+    name: gitlab_default
+  postgres-dev-net:
+    external: true
+    name: postgres-dev-net
