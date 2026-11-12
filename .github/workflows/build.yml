@@ -1,4 +1,4 @@
-name: Build OpenChamber image
+name: Build OpenChamber + OpenCode image
 
 on:
   workflow_dispatch:
@@ -20,36 +20,44 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
-      - name: Get latest stable upstream release
-        id: upstream
+      - name: Resolve stable releases independently
+        id: versions
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          TAG="$(gh api repos/openchamber/openchamber/releases/latest --jq '.tag_name')"
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Unexpected upstream release tag: $TAG" >&2; exit 1; }
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/openchamber" >> "$GITHUB_OUTPUT"
+          CHAMBER_TAG="$(gh api repos/openchamber/openchamber/releases/latest --jq '.tag_name')"
+          CODE_VERSION="$(npm view @opencode/cli dist-tags.latest)"
+          [[ "$CHAMBER_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Unexpected OpenChamber tag: $CHAMBER_TAG" >&2; exit 1; }
+          [[ "$CODE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Unexpected OpenCode version: $CODE_VERSION" >&2; exit 1; }
+          IMAGE="ghcr.io/${{ github.repository_owner }}"/openchamber
+          IMAGE="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')"
+          echo "chamber=$CHAMBER_TAG" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "combo=$CHAMBER_TAG-opencode-$CODE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building $CHAMBER_TAG with OpenCode $CODE_VERSION"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check if release image already exists
+      - name: Check if this version combination exists
         id: check
         shell: bash
         run: |
-          if docker buildx imagetools inspect "${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.tag }}" >/dev/null 2>&1; then
+          if docker buildx imagetools inspect "${{ steps.versions.outputs.image }}:${{ steps.versions.outputs.combo }}" >/dev/null 2>&1; then
             echo 'exists=true' >> "$GITHUB_OUTPUT"
-            echo 'This version was already published; build skipped.'
+            echo 'Already published; skipping build.'
           else
             echo 'exists=false' >> "$GITHUB_OUTPUT"
           fi
@@ -59,24 +67,95 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: openchamber/openchamber
-          ref: ${{ steps.upstream.outputs.tag }}
+          ref: ${{ steps.versions.outputs.chamber }}
           path: upstream
           persist-credentials: false
 
-      - name: Build and publish stable image
+      - name: Set requested stable OpenCode version
+        if: steps.check.outputs.exists != 'true'
+        env:
+          OPENCODE_VERSION: ${{ steps.versions.outputs.code }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          path = pathlib.Path("upstream/Dockerfile")
+          original = path.read_text()
+          version = os.environ["OPENCODE_VERSION"]
+          updated, replacements = re.subn(
+              r'(?<=npm install -g )@opencode/cli@[0-9]+\.[0-9]+\.[0-9]+',
+              f'@opencode/cli${{version}',
+              original,
+          )
+          if replacements != 1:
+              raise SystemExit(f"Expected exactly one OpenCode version pin, found {replacements}")
+          path.write_text(updated)
+          print(f"Using @opencode/cli${{version} with official OpenChamber sources")
+          PY
+
+      - name: Build test image
         if: steps.check.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
           context: ./upstream
           file: ./upstream/Dockerfile
           platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.tag }}
-            ${{ steps.upstream.outputs.image }}:latest
+          load: true
+          push: false
+          tags: openchamber-ci:candidate
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ steps.upstream.outputs.tag }}
-            org.opencontainers.image.description=OpenChamber official source release built for amd64
+            org.opencontainers.image.version=${{ steps.versions.outputs.chamber }}
+            org.opencontainers.image.description=Official OpenChamber release with independently tracked stable OpenCode
+            org.opencontainers.image.title=OpenChamber + OpenCode
+            org.opencontainers.image.vendor=Community Build
+            dev.edoor.opencode.version=${{ steps.versions.outputs.code }}
           cache-from: type=gha
           cache-to: type=gha,mode=min
+
+      - name: Smoke test OpenCode and OpenChamber
+        if: steps.check.outputs.exists != 'true'
+        env:
+          EXPECTED_OPENCODE: ${{ steps.versions.outputs.code }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTUAL="$(docker run --rm --entrypoint opencode openchamber-ci:candidate --version)"
+          echo "OpenCode reported: $ACTUAL"
+          [[ "$ACTUAL" == "$EXPECTED_OPENCODE" || "$ACTUAL" == *" $EXPECTED_OPENCODE" ]] || { echo "OpenCode version mismatch" >&2; exit 1; }
+
+          docker run -d --name openchamber-smoke \
+            -p 127.0.0.1:3000:3000 \
+            -e OPENCHAMBER_UI_PASSWORD="ci-smoke-test-only" \
+            openchamber-ci:candidate
+          trap 'docker rm -f openchamber-smoke >/dev/null 2>&1 || true' EXIT
+          HEALTHY=0
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent --show-error --max-time 2 http://127.0.0.1:3000/health >/dev/null 2>&1; then
+              HEALTHY=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$HEALTHY" -ne 1 ]; then
+            docker logs --tail 100 openchamber-smoke
+            echo "OpenChamber health check failed" >&2
+            exit 1
+          fi
+          echo "OpenCode version and OpenChamber health checks passed."
+
+      - name: Publish verified image
+        if: steps.check.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.versions.outputs.image }}"
+          COMBO="${{ steps.versions.outputs.combo }}"
+          docker tag openchamber-ci:candidate "$IMAGE:$COMBO"
+          docker tag openchamber-ci:candidate "$IMAGE:latest"
+          docker push "$IMAGE:$COMBO"
+          docker push "$IMAGE:latest"
+          echo "Published $IMAGE:$COMBO and $IMAGE:latest"
