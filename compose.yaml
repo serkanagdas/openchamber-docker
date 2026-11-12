@@ -1,0 +1,40 @@
+name: openchamber
+
+x-arcane:
+  icon: openchamber
+  urls:
+    - "https://edoor.taila48207.ts.net:10020"
+
+services:
+  openchamber:
+    image: ghcr.io/serkanagdas/openchamber:latest
+    container_name: openchamber
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3100:3000"
+    environment:
+      OPENCHAMBER_UI_PASSWORD: ${OPENCHAMBER_UI_PASSWORD:?Password required}
+    volumes:
+      - oc_config:/home/openchamber/.config/openchamber
+      - oc_share:/home/openchamber/.local/share/opencode
+      - oc_state:/home/openchamber/.local/state/opencode
+      - oc_opencode:/home/openchamber/.config/opencode
+      - oc_ssh:/home/openchamber/.ssh
+      - projects:/home/openchamber/workspaces
+    networks:
+      - default
+      - ai-gateway
+
+volumes:
+  oc_config:
+  oc_share:
+  oc_state:
+  oc_opencode:
+  oc_ssh:
+  projects:
+    external: true
+    name: openahands_openhands_projects
+
+networks:
+  ai-gateway:
+    external: true
