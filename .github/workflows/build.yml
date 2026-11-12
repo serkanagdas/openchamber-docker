@@ -21,7 +21,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Get latest stable upstream release
+      - name: Get latest stable upstream release and OpenCode v2 version
         id: upstream
         env:
           GH_TOKEN: ${{ github.token }}
@@ -30,7 +30,12 @@ jobs:
           set -euo pipefail
           TAG="$(gh api repos/openchamber/openchamber/releases/latest --jq '.tag_name')"
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Unexpected upstream release tag: $TAG" >&2; exit 1; }
+          OC_VER="$(curl -fsSL https://registry.npmjs.org/@opencode/cli/latest | jq -r '.version')"
+          [[ "$OC_VER" =~ ^2\.[0-9]+\.[0-9]+ ]] || { echo "Unexpected @opencode/cli version: $OC_VER" >&2; exit 1; }
+          COMBINED_TAG="${TAG}-oc${OC_VER}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "oc_ver=$OC_VER" >> "$GITHUB_OUTPUT"
+          echo "combined_tag=$COMBINED_TAG" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/openchamber" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -43,13 +48,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check if release image already exists
+      - name: Check if release + OpenCode image already exists
         id: check
         shell: bash
         run: |
-          if docker buildx imagetools inspect "${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.tag }}" >/dev/null 2>&1; then
+          if [[ "${{ github.event_name }}" == "schedule" ]] && docker buildx imagetools inspect "${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.combined_tag }}" >/dev/null 2>&1; then
             echo 'exists=true' >> "$GITHUB_OUTPUT"
-            echo 'This version was already published; build skipped.'
+            echo "This combination (${{ steps.upstream.outputs.combined_tag }}) was already published; build skipped."
           else
             echo 'exists=false' >> "$GITHUB_OUTPUT"
           fi
@@ -63,6 +68,14 @@ jobs:
           path: upstream
           persist-credentials: false
 
+      - name: Patch Dockerfile to install latest OpenCode v2 (@opencode/cli@latest)
+        if: steps.check.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i -E 's/@opencode\/cli@[0-9A-Za-z._-]+/@opencode\/cli@latest/g' upstream/Dockerfile
+          grep -n "@opencode/cli@latest" upstream/Dockerfile
+
       - name: Build and publish stable image
         if: steps.check.outputs.exists != 'true'
         uses: docker/build-push-action@v6
@@ -73,10 +86,11 @@ jobs:
           push: true
           tags: |
             ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.tag }}
+            ${{ steps.upstream.outputs.image }}:${{ steps.upstream.outputs.combined_tag }}
             ${{ steps.upstream.outputs.image }}:latest
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ steps.upstream.outputs.tag }}
-            org.opencontainers.image.description=OpenChamber official source release built for amd64
+            org.opencontainers.image.version=${{ steps.upstream.outputs.combined_tag }}
+            org.opencontainers.image.description=OpenChamber (${{ steps.upstream.outputs.tag }}) + OpenCode v2 (${{ steps.upstream.outputs.oc_ver }}) built for amd64
           cache-from: type=gha
           cache-to: type=gha,mode=min
