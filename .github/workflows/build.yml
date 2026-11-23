@@ -68,13 +68,15 @@ jobs:
           path: upstream
           persist-credentials: false
 
-      - name: Patch Dockerfile to install latest OpenCode v2 (@opencode/cli@latest)
+      - name: Patch Dockerfile to install resolved OpenCode v2 version
         if: steps.check.outputs.exists != 'true'
+        env:
+          OC_VER: ${{ steps.upstream.outputs.oc_ver }}
         shell: bash
         run: |
           set -euo pipefail
-          sed -i -E 's/@opencode\/cli@[0-9A-Za-z._-]+/@opencode\/cli@latest/g' upstream/Dockerfile
-          grep -n "@opencode/cli@latest" upstream/Dockerfile
+          sed -i -E "s/@opencode\/cli@[0-9A-Za-z._-]+/@opencode\/cli@${OC_VER}/g" upstream/Dockerfile
+          grep -n "@opencode/cli@${OC_VER}" upstream/Dockerfile
 
       - name: Build and publish stable image
         if: steps.check.outputs.exists != 'true'
